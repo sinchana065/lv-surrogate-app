@@ -1,85 +1,196 @@
+import os, io, time, sys
 import numpy as np
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import streamlit as st
+import h5py
+import pandas as pd
 
-from inference import load_dataset, load_model, predict_index
+# --------------------------------------------------------
+# Ensure "src" folder (from lv_capstone) is importable
+# --------------------------------------------------------
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.join(ROOT, "src") not in sys.path:
+    sys.path.insert(0, os.path.join(ROOT, "src"))
 
-st.set_page_config(page_title="LV Surrogate App", layout="wide")
-st.title("🫀 Left Ventricle Hemodynamics — Real-time Surrogate")
+from fno import FNO2d  # src/fno.py must define FNO2d
 
-@st.cache_resource
-def _cached_model():
-    model, device, base, wpath = load_model()
-    return model, device, base, wpath
+# --------------------------------------------------------
+# App configuration
+# --------------------------------------------------------
+st.set_page_config(page_title="LV Digital Twin", layout="wide")
+st.title("🫀 LV Digital Twin — Real-time Hemodynamics ")
 
-@st.cache_resource
-def _cached_dataset():
-    return load_dataset(split="test")
+DEVICE = torch.device("cpu")  # Streamlit Cloud runs CPU
+IN_CH, OUT_CH = 1, 3
+GRID_H, GRID_W = 128, 128
+H5_PATH = os.path.join(ROOT, "data", "synthetic_lv_dataset_small.h5")
+CKPT_PATH = os.path.join(ROOT, "fno_mcwilliams.pth")
 
-def _imshow(ax, arr, title, vmin=None, vmax=None, cmap="jet"):
-    im = ax.imshow(arr, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_title(title)
-    ax.set_xticks([]); ax.set_yticks([])
-    return im
+# --------------------------------------------------------
+# Cached loaders
+# --------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_model() -> nn.Module:
+    model = FNO2d(IN_CH, OUT_CH, modes1=16, modes2=16, width=32).to(DEVICE)
+    if not os.path.exists(CKPT_PATH):
+        st.error(f"❌ Model weights not found at {CKPT_PATH}")
+        st.stop()
+    sd = torch.load(CKPT_PATH, map_location=DEVICE)
+    model.load_state_dict(sd)
+    model.eval()
+    return model
 
-def _metrics(a, b):
-    a = np.asarray(a); b = np.asarray(b)
-    mae  = float(np.mean(np.abs(a-b)))
-    rmse = float(np.sqrt(np.mean((a-b)**2)))
-    return mae, rmse
+@st.cache_data(show_spinner=False)
+def load_h5():
+    if not os.path.exists(H5_PATH):
+        st.error(f"❌ Dataset not found at {H5_PATH}")
+        st.stop()
+    with h5py.File(H5_PATH, "r") as f:
+        sdf = f["inputs/sdf"][:]           # (N,128,128)
+        u = f["labels/u"][:]
+        v = f["labels/v"][:]
+        p = f["labels/p"][:]
+        scalars = {
+            "hr": f["inputs/hr"][:],
+            "sbp": f["inputs/sbp"][:],
+            "dbp": f["inputs/dbp"][:],
+            "phase": f["inputs/phase"][:],
+        }
+    X = torch.tensor(sdf, dtype=torch.float32).unsqueeze(1)   # (N,1,H,W)
+    Y = torch.stack([
+        torch.tensor(u, dtype=torch.float32),
+        torch.tensor(v, dtype=torch.float32),
+        torch.tensor(p, dtype=torch.float32)
+    ], dim=1)  # (N,3,H,W)
+    return X, Y, scalars
 
-# Load once (cached)
-try:
-    model, device, base, wpath = _cached_model()
-    ds = _cached_dataset()
-    st.sidebar.success(f"Model loaded (base={base})")
-    st.sidebar.caption(f"Weights: {wpath.split('/')[-1]}")
-    st.sidebar.caption(f"Device: {device}")
-except Exception as e:
-    st.error(str(e))
-    st.stop()
+model = load_model()
+X, Y, scalars = load_h5()
+N = X.shape[0]
 
-# Sidebar controls
+# --------------------------------------------------------
+# Sidebar Controls
+# --------------------------------------------------------
 st.sidebar.header("Controls")
-idx = st.sidebar.slider("Sample index (test split)", 0, len(ds)-1, 0)
-run = st.sidebar.button("Run Inference", type="primary")
 
-if run:
-    with st.spinner("Running model..."):
-        x, y_true, y_pred = predict_index(model, device, ds, idx)
-        x_np     = x.numpy()             # [6, H, W] (not used visually yet)
-        y_true_n = y_true.numpy()        # [3, H, W]
-        y_pred_n = y_pred.numpy()        # [3, H, W]
+presets = {
+    "Healthy (example)": 0,
+    "Hypertensive (example)": min(5, N-1),
+    "Tachycardia (example)": min(10, N-1)
+}
+preset_choice = st.sidebar.selectbox("Scenario Preset", list(presets.keys()))
+default_idx = presets[preset_choice]
 
-        # Per-channel metrics
-        names = ["u","v","p"]
-        rows = []
-        for i, nm in enumerate(names):
-            mae, rmse = _metrics(y_true_n[i], y_pred_n[i])
-            rows.append((nm, mae, rmse))
+idx = st.sidebar.slider("Validation Sample", 0, N-1, value=default_idx, step=1)
 
-        # 3x3 grid: true / pred / |error| for u,v,p
-        fig, axes = plt.subplots(3, 3, figsize=(12, 10), constrained_layout=True)
-        for r, nm in enumerate(names):
-            vmin = min(y_true_n[r].min(), y_pred_n[r].min())
-            vmax = max(y_true_n[r].max(), y_pred_n[r].max())
-            _imshow(axes[r,0], y_true_n[r], f"{nm} (true)", vmin=vmin, vmax=vmax)
-            _imshow(axes[r,1], y_pred_n[r], f"{nm} (pred)", vmin=vmin, vmax=vmax)
-            _imshow(axes[r,2], np.abs(y_true_n[r]-y_pred_n[r]), f"{nm} (error)", cmap="inferno")
-        st.pyplot(fig)
+# Display dataset parameters
+st.sidebar.markdown("### Sample Parameters")
+st.sidebar.write(f"HR: **{float(scalars['hr'][idx]):.1f} bpm**")
+st.sidebar.write(f"SBP: **{float(scalars['sbp'][idx]):.1f} mmHg**")
+st.sidebar.write(f"DBP: **{float(scalars['dbp'][idx]):.1f} mmHg**")
+st.sidebar.write(f"Phase: **{int(scalars['phase'][idx])}**")
 
-        # Table of metrics
-        st.subheader("Per-channel error")
-        st.write(
-            "| Channel | MAE | RMSE |\n|---|---:|---:|\n" +
-            "\n".join([f"| {n} | {mae:.4f} | {rmse:.4f} |" for (n,mae,rmse) in rows])
-        )
+show_diff = st.sidebar.checkbox("Show difference maps (Pred − True)", value=True)
 
-        # Velocity magnitude (pred)
-        vel_mag = np.sqrt(y_pred_n[0]**2 + y_pred_n[1]**2)
-        fig2, ax2 = plt.subplots(1,1, figsize=(5,4))
-        _imshow(ax2, vel_mag, "Velocity magnitude (pred)")
-        st.pyplot(fig2)
-else:
-    st.info("Pick a **sample index** on the left and click **Run Inference** to visualize predictions.")
+# --------------------------------------------------------
+# Inference
+# --------------------------------------------------------
+xb = X[idx:idx+1].to(DEVICE)
+yb = Y[idx:idx+1].to(DEVICE)
+
+with torch.no_grad():
+    t0 = time.time()
+    pred = model(xb)
+    infer_ms = (time.time() - t0) * 1000.0
+
+# Metrics
+mse_overall = torch.mean((pred - yb) ** 2).item()
+mse_ch = torch.mean((pred - yb) ** 2, dim=(0,2,3)).squeeze(0).cpu().numpy()
+
+colA, colB, colC, colD, colE = st.columns(5)
+
+colA.metric("MSE (overall)", f"{mse_overall:.4f}")
+colB.metric("MSE u", f"{mse_ch[0]:.4f}")
+colC.metric("MSE v", f"{mse_ch[1]:.4f}")
+colD.metric("MSE p", f"{mse_ch[2]:.4f}")
+colE.metric("Inference time", f"{infer_ms:.1f} ms")
+
+
+# --------------------------------------------------------
+# Visualization
+# --------------------------------------------------------
+fields = ["u", "v", "p"]
+pred_np = pred[0].cpu().numpy()
+true_np = yb[0].cpu().numpy()
+
+fig, axes = plt.subplots(2, 3, figsize=(10, 6))
+for j in range(3):
+    im = axes[0, j].imshow(pred_np[j], cmap="jet")
+    axes[0, j].set_title(f"Pred {fields[j]}")
+    axes[0, j].axis("off")
+    plt.colorbar(im, ax=axes[0, j], fraction=0.046, pad=0.04)
+for j in range(3):
+    im = axes[1, j].imshow(true_np[j], cmap="jet")
+    axes[1, j].set_title(f"True {fields[j]}")
+    axes[1, j].axis("off")
+    plt.colorbar(im, ax=axes[1, j], fraction=0.046, pad=0.04)
+plt.tight_layout()
+st.pyplot(fig, clear_figure=True)
+
+# Difference maps
+if show_diff:
+    diff = pred_np - true_np
+    fig2, ax2 = plt.subplots(1, 3, figsize=(10, 3))
+    for j in range(3):
+        im = ax2[j].imshow(diff[j], cmap="bwr")
+        ax2[j].set_title(f"Diff {fields[j]} (Pred−True)")
+        ax2[j].axis("off")
+        plt.colorbar(im, ax=ax2[j], fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    st.pyplot(fig2, clear_figure=True)
+
+# --------------------------------------------------------
+# Downloads (fixed PNG export)
+# --------------------------------------------------------
+# Re-generate the Pred/True plot for saving
+fig_dl, axes_dl = plt.subplots(2, 3, figsize=(10, 6))
+for j in range(3):
+    im = axes_dl[0, j].imshow(pred_np[j], cmap="jet")
+    axes_dl[0, j].set_title(f"Pred {fields[j]}")
+    axes_dl[0, j].axis("off")
+    plt.colorbar(im, ax=axes_dl[0, j], fraction=0.046, pad=0.04)
+for j in range(3):
+    im = axes_dl[1, j].imshow(true_np[j], cmap="jet")
+    axes_dl[1, j].set_title(f"True {fields[j]}")
+    axes_dl[1, j].axis("off")
+    plt.colorbar(im, ax=axes_dl[1, j], fraction=0.046, pad=0.04)
+plt.tight_layout()
+
+buf = io.BytesIO()
+fig_dl.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+buf.seek(0)
+st.download_button("⬇️ Download Pred/True PNG", data=buf,
+                   file_name=f"lv_pred_true_{idx}.png", mime="image/png")
+plt.close(fig_dl)
+
+# CSV
+df = pd.DataFrame({
+    "sample_idx":[idx],
+    "mse_overall":[mse_overall],
+    "mse_u":[float(mse_ch[0])],
+    "mse_v":[float(mse_ch[1])],
+    "mse_p":[float(mse_ch[2])],
+    "hr":[float(scalars['hr'][idx])],
+    "sbp":[float(scalars['sbp'][idx])],
+    "dbp":[float(scalars['dbp'][idx])],
+    "phase":[int(scalars['phase'][idx])]
+})
+csv_bytes = df.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download metrics CSV", data=csv_bytes,
+                   file_name=f"lv_metrics_{idx}.csv", mime="text/csv")
+
+st.caption("Prototype app: FNO2d surrogate for LV hemodynamics. "
+           "Features: sample slider, presets, metrics, difference maps, downloads.")
 
